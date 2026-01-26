@@ -33,6 +33,47 @@ static uint8_t g_py_major = 0;
 static uint8_t g_py_minor = 0;
 
 // ============================================================================
+// Marshal Reference Table
+// ============================================================================
+
+// Reference table for resolving TYPE_REF during marshal parsing
+// Objects with FLAG_REF set are added to this table in order,
+// then TYPE_REF can look them up by index.
+// We track ALL objects (strings get actual values, others get placeholders)
+// because reference indices must be consistent.
+struct marshal_refs_t {
+    qvector<qstring> values;   // Reference values (strings get actual content)
+    qvector<bool> is_string;   // Whether this entry is a real string
+    
+    void clear() { 
+        values.clear(); 
+        is_string.clear();
+    }
+    
+    void add_string(const qstring& s) {
+        values.push_back(s);
+        is_string.push_back(true);
+    }
+    
+    void add_placeholder() {
+        values.push_back(qstring());
+        is_string.push_back(false);
+    }
+    
+    bool get_string(uint32_t idx, qstring* out) const {
+        if (idx < values.size() && is_string[idx]) {
+            *out = values[idx];
+            return true;
+        }
+        return false;
+    }
+    
+    size_t size() const { return values.size(); }
+};
+
+static marshal_refs_t g_refs;
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -101,6 +142,7 @@ struct pyc_code_info_t {
 // ============================================================================
 
 static bool skip_marshal_object(linput_t* li);
+static bool read_marshal_string(linput_t* li, qstring* out);
 static bool read_marshal_as_string(linput_t* li, qstring* out, 
                                    qvector<pyc_code_info_t>* nested_codes, int depth);
 static bool parse_code_object_inner(linput_t* li, pyc_code_info_t* info, int depth);
@@ -191,9 +233,20 @@ static bool skip_code_object(linput_t* li) {
 }
 
 static bool skip_marshal_object(linput_t* li) {
-    uint8_t type;
-    if (qlread(li, &type, 1) != 1) return false;
-    type &= ~marshal::FLAG_REF;
+    uint8_t raw_type;
+    if (qlread(li, &raw_type, 1) != 1) return false;
+    
+    bool has_ref = (raw_type & marshal::FLAG_REF) != 0;
+    uint8_t type = raw_type & ~marshal::FLAG_REF;
+    
+    // Track reference - add placeholder for non-strings
+    // (strings are tracked in read_marshal_string)
+    if (has_ref && type != marshal::TYPE_STRING && 
+        type != marshal::TYPE_INTERNED && type != marshal::TYPE_ASCII &&
+        type != marshal::TYPE_ASCII_INTERNED && type != marshal::TYPE_UNICODE &&
+        type != marshal::TYPE_SHORT_ASCII && type != marshal::TYPE_SHORT_ASCII_INTERNED) {
+        g_refs.add_placeholder();
+    }
     
     switch (type) {
         case marshal::TYPE_NULL:
@@ -224,12 +277,27 @@ static bool skip_marshal_object(linput_t* li) {
         case marshal::TYPE_INTERNED:
         case marshal::TYPE_ASCII:
         case marshal::TYPE_ASCII_INTERNED:
-        case marshal::TYPE_UNICODE:
+        case marshal::TYPE_UNICODE: {
+            // Track string in reference table if FLAG_REF
+            if (has_ref) {
+                int64_t pos = qltell(li) - 1;  // Rewind to type byte
+                qlseek(li, pos);
+                qstring s;
+                return read_marshal_string(li, &s);  // This adds to g_refs
+            }
             return skip_string(li, type);
+        }
             
         case marshal::TYPE_SHORT_ASCII:
-        case marshal::TYPE_SHORT_ASCII_INTERNED:
+        case marshal::TYPE_SHORT_ASCII_INTERNED: {
+            if (has_ref) {
+                int64_t pos = qltell(li) - 1;
+                qlseek(li, pos);
+                qstring s;
+                return read_marshal_string(li, &s);
+            }
             return skip_string(li, type);
+        }
             
         case marshal::TYPE_TUPLE:
         case marshal::TYPE_LIST:
@@ -290,9 +358,11 @@ static bool skip_marshal_object(linput_t* li) {
 // ============================================================================
 
 static bool read_marshal_string(linput_t* li, qstring* out) {
-    uint8_t type;
-    if (qlread(li, &type, 1) != 1) return false;
-    type &= ~marshal::FLAG_REF;
+    uint8_t raw_type;
+    if (qlread(li, &raw_type, 1) != 1) return false;
+    
+    bool has_ref = (raw_type & marshal::FLAG_REF) != 0;
+    uint8_t type = raw_type & ~marshal::FLAG_REF;
     
     uint32_t len;
     switch (type) {
@@ -309,16 +379,24 @@ static bool read_marshal_string(linput_t* li, qstring* out) {
             break;
         case marshal::TYPE_NONE:
             *out = "None";
+            if (has_ref) g_refs.add_string(*out);
             return true;
-        case marshal::TYPE_REF:
-            read_le32(li);  // Skip ref index
-            out->sprnt("<ref>");
+        case marshal::TYPE_REF: {
+            // Look up reference in table
+            uint32_t ref_idx = read_le32(li);
+            if (g_refs.get_string(ref_idx, out))
+                return true;
+            out->sprnt("<ref_%u>", ref_idx);
             return true;
-        case marshal::TYPE_STRINGREF:
+        }
+        case marshal::TYPE_STRINGREF: {
             // Reference to an interned string (Python 2.x)
-            read_le32(li);  // Skip ref index
-            out->sprnt("<ref>");
+            uint32_t ref_idx = read_le32(li);
+            if (g_refs.get_string(ref_idx, out))
+                return true;
+            out->sprnt("<ref_%u>", ref_idx);
             return true;
+        }
         default:
             return false;
     }
@@ -326,6 +404,10 @@ static bool read_marshal_string(linput_t* li, qstring* out) {
     out->resize(len);
     if (len > 0 && qlread(li, out->begin(), len) != len)
         return false;
+    
+    // Add to reference table if FLAG_REF was set
+    if (has_ref)
+        g_refs.add_string(*out);
     
     return true;
 }
@@ -335,15 +417,22 @@ static bool read_marshal_string(linput_t* li, qstring* out) {
 // ============================================================================
 
 static bool read_marshal_bytes(linput_t* li, qvector<uint8_t>* out) {
-    uint8_t type;
-    if (qlread(li, &type, 1) != 1) return false;
-    type &= ~marshal::FLAG_REF;
+    uint8_t raw_type;
+    if (qlread(li, &raw_type, 1) != 1) return false;
+    
+    bool has_ref = (raw_type & marshal::FLAG_REF) != 0;
+    uint8_t type = raw_type & ~marshal::FLAG_REF;
     
     // Handle reference to previously seen bytes object
     if (type == marshal::TYPE_REF) {
         qlseek(li, 4, SEEK_CUR);  // Skip ref index
         out->clear();
         return true;
+    }
+    
+    // Track in reference table if FLAG_REF was set (bytes are non-string, use placeholder)
+    if (has_ref) {
+        g_refs.add_placeholder();
     }
     
     uint32_t len;
@@ -368,9 +457,12 @@ static bool read_marshal_bytes(linput_t* li, qvector<uint8_t>* out) {
 // ============================================================================
 
 static bool read_tuple_header(linput_t* li, uint32_t* count) {
-    uint8_t type;
-    if (qlread(li, &type, 1) != 1) return false;
-    type &= ~marshal::FLAG_REF;
+    uint8_t raw_type;
+    if (qlread(li, &raw_type, 1) != 1) return false;
+    
+    // Note: We don't track tuples in g_refs since they're containers,
+    // not atomic values. The strings inside them will be tracked.
+    uint8_t type = raw_type & ~marshal::FLAG_REF;
     
     if (type == marshal::TYPE_SMALL_TUPLE) {
         *count = read_byte(li);
@@ -379,8 +471,9 @@ static bool read_tuple_header(linput_t* li, uint32_t* count) {
         *count = read_le32(li);
         return true;
     } else if (type == marshal::TYPE_REF) {
-        // Reference to a previously-seen tuple - skip the 4-byte index
-        // We can't resolve the reference, so return 0 items
+        // Reference to a previously-seen tuple
+        // For tuples, we can't easily resolve them, so return 0 items
+        // This typically happens when the same tuple is used multiple times
         qlseek(li, 4, SEEK_CUR);
         *count = 0;
         return true;
@@ -395,38 +488,47 @@ static bool read_tuple_header(linput_t* li, uint32_t* count) {
 static bool read_marshal_as_string(linput_t* li, qstring* out, 
                                    qvector<pyc_code_info_t>* nested_codes, int depth) {
     int64_t start_pos = qltell(li);
-    uint8_t type;
-    if (qlread(li, &type, 1) != 1) return false;
-    type &= ~marshal::FLAG_REF;
+    uint8_t raw_type;
+    if (qlread(li, &raw_type, 1) != 1) return false;
+    
+    bool has_ref = (raw_type & marshal::FLAG_REF) != 0;
+    uint8_t type = raw_type & ~marshal::FLAG_REF;
     
     switch (type) {
         case marshal::TYPE_NONE:
             *out = "None";
+            if (has_ref) g_refs.add_string(*out);
             return true;
         case marshal::TYPE_TRUE:
             *out = "True";
+            if (has_ref) g_refs.add_string(*out);
             return true;
         case marshal::TYPE_FALSE:
             *out = "False";
+            if (has_ref) g_refs.add_string(*out);
             return true;
         case marshal::TYPE_ELLIPSIS:
             *out = "...";
+            if (has_ref) g_refs.add_string(*out);
             return true;
         case marshal::TYPE_INT: {
             int32_t val = (int32_t)read_le32(li);
             out->sprnt("%d", val);
+            if (has_ref) g_refs.add_string(*out);
             return true;
         }
         case marshal::TYPE_INT64: {
             int64_t val;
             if (qlread(li, &val, 8) != 8) return false;
             out->sprnt("%lld", (long long)val);
+            if (has_ref) g_refs.add_string(*out);
             return true;
         }
         case marshal::TYPE_BINARY_FLOAT: {
             double val;
             if (qlread(li, &val, 8) != 8) return false;
             out->sprnt("%g", val);
+            if (has_ref) g_refs.add_string(*out);
             return true;
         }
         case marshal::TYPE_STRING:
@@ -436,7 +538,7 @@ static bool read_marshal_as_string(linput_t* li, qstring* out,
         case marshal::TYPE_UNICODE:
         case marshal::TYPE_SHORT_ASCII:
         case marshal::TYPE_SHORT_ASCII_INTERNED: {
-            qlseek(li, start_pos);  // Rewind
+            qlseek(li, start_pos);  // Rewind to let read_marshal_string handle FLAG_REF
             qstring str;
             if (!read_marshal_string(li, &str)) return false;
             // Escape and quote the string
@@ -445,7 +547,11 @@ static bool read_marshal_as_string(linput_t* li, qstring* out,
         }
         case marshal::TYPE_TUPLE:
         case marshal::TYPE_SMALL_TUPLE: {
-            qlseek(li, start_pos);  // Rewind
+            // Add placeholder BEFORE parsing contents (for FLAG_REF)
+            if (has_ref)
+                g_refs.add_placeholder();
+            
+            qlseek(li, start_pos);  // Rewind to re-read tuple header
             uint32_t count;
             if (!read_tuple_header(li, &count)) return false;
             *out = "(";
@@ -468,6 +574,10 @@ static bool read_marshal_as_string(linput_t* li, qstring* out,
             return true;
         }
         case marshal::TYPE_CODE: {
+            // Add placeholder BEFORE parsing (reference index is assigned at type byte)
+            if (has_ref)
+                g_refs.add_placeholder();
+            
             // Parse the nested code object and store it
             pyc_code_info_t nested;
             if (parse_code_object_inner(li, &nested, depth + 1)) {
@@ -480,8 +590,11 @@ static bool read_marshal_as_string(linput_t* li, qstring* out,
             return true;
         }
         case marshal::TYPE_REF: {
-            uint32_t ref = read_le32(li);
-            out->sprnt("<ref:%u>", ref);
+            // Look up reference in table
+            uint32_t ref_idx = read_le32(li);
+            if (g_refs.get_string(ref_idx, out))
+                return true;
+            out->sprnt("<ref_%u>", ref_idx);
             return true;
         }
         case marshal::TYPE_LONG: {
@@ -490,12 +603,14 @@ static bool read_marshal_as_string(linput_t* li, qstring* out,
             if (neg) n = -n;
             qlseek(li, n * 2, SEEK_CUR);  // Skip the digits
             out->sprnt("<long%s>", neg ? "-" : "+");
+            if (has_ref) g_refs.add_string(*out);
             return true;
         }
         default: {
             out->sprnt("<type:0x%02X>", type);
             qlseek(li, start_pos);  // Rewind
             skip_marshal_object(li);  // Skip it
+            if (has_ref) g_refs.add_string(*out);
             return true;
         }
     }
@@ -864,6 +979,9 @@ static void idaapi load_pyc_file(linput_t* li, ushort /*neflags*/, const char* f
     g_py_major = ver->major;
     g_py_minor = ver->minor;
     
+    // Clear reference table for this file
+    g_refs.clear();
+    
     // Position to start of code object
     if (is_raw_marshal) {
         qlseek(li, 0);  // Raw marshal starts at beginning
@@ -885,6 +1003,10 @@ static void idaapi load_pyc_file(linput_t* li, ushort /*neflags*/, const char* f
         loader_failure("Expected code object at root, got type 0x%02X", type);
         return;
     }
+    
+    // Track root code object in reference table if it has FLAG_REF
+    if (has_ref)
+        g_refs.add_placeholder();
     
     // Parse the root code object
     pyc_code_info_t root_code;

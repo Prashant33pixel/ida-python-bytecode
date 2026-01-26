@@ -18,6 +18,8 @@ enum specflag : uint8_t {
     SPEC_FREE   = 4,    // Index into co_cellvars + co_freevars
     SPEC_CMP    = 5,    // Comparison operator
     SPEC_BINOP  = 6,    // Binary operator
+    SPEC_COMMON_CONST = 7,  // Common constant (3.14+): AssertionError, etc.
+    SPEC_LOCAL_PAIR   = 8,  // Two packed 4-bit local indices (3.13+)
 };
 
 } // namespace ida

@@ -294,6 +294,21 @@ int pyc_t::ana(insn_t* insn) {
                 insn->Op1.specflag1 = ida::SPEC_CMP;
                 break;
                 
+            case bytecode::operand_type::binop:
+                insn->Op1.type = o_imm;
+                insn->Op1.specflag1 = ida::SPEC_BINOP;
+                break;
+                
+            case bytecode::operand_type::common_const:
+                insn->Op1.type = o_imm;
+                insn->Op1.specflag1 = ida::SPEC_COMMON_CONST;
+                break;
+                
+            case bytecode::operand_type::local_pair:
+                insn->Op1.type = o_imm;
+                insn->Op1.specflag1 = ida::SPEC_LOCAL_PAIR;
+                break;
+                
             case bytecode::operand_type::jrel: {
                 // Relative forward jump
                 ea_t target;
@@ -461,11 +476,12 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                 }
                     
                 case ida::SPEC_CMP: {
-                    // Comparison operator
-                    // Python 3.12+ encodes comparison in bits 5-7
-                    bool is_312_plus = (version_major > 3) || 
-                                       (version_major == 3 && version_minor >= 12);
-                    const char* cmp_name = bytecode::operators::get_cmp_op_name((uint8_t)op.value, is_312_plus);
+                    // Comparison operator encoding varies by version:
+                    // - Python 3.12: bits 4-7 (>> 4)
+                    // - Python 3.13+: bits 5-7 (>> 5)
+                    // - Python < 3.12: direct index
+                    const char* cmp_name = bytecode::operators::get_cmp_op_name(
+                        (uint8_t)op.value, version_major, version_minor);
                     ctx.out_line(cmp_name, COLOR_SYMBOL);
                     break;
                 }
@@ -474,6 +490,49 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                     // Binary operator
                     const char* op_name = bytecode::operators::get_binary_op_name((uint8_t)op.value);
                     ctx.out_line(op_name, COLOR_SYMBOL);
+                    break;
+                }
+                
+                case ida::SPEC_COMMON_CONST: {
+                    // Common constant (3.14+)
+                    static const char* const common_consts[] = {
+                        "AssertionError",
+                        "NotImplementedError", 
+                        "tuple",
+                        "all",
+                        "any"
+                    };
+                    uint8_t idx = (uint8_t)op.value;
+                    if (idx < sizeof(common_consts)/sizeof(common_consts[0])) {
+                        ctx.out_line(common_consts[idx], COLOR_IMPNAME);
+                    } else {
+                        ctx.out_long((uint32_t)op.value, 10);
+                    }
+                    break;
+                }
+                
+                case ida::SPEC_LOCAL_PAIR: {
+                    // Two packed 4-bit local indices: arg>>4, arg&15
+                    uint8_t idx1 = (uint8_t)op.value >> 4;
+                    uint8_t idx2 = (uint8_t)op.value & 0xF;
+                    
+                    qstring var1, var2;
+                    bool got1 = get_varname_string(ctx.insn.ea, idx1, &var1);
+                    bool got2 = get_varname_string(ctx.insn.ea, idx2, &var2);
+                    
+                    if (got1) {
+                        ctx.out_line(var1.c_str(), COLOR_LOCNAME);
+                    } else {
+                        ctx.out_char('$');
+                        ctx.out_long(idx1, 10);
+                    }
+                    ctx.out_line(", ", COLOR_SYMBOL);
+                    if (got2) {
+                        ctx.out_line(var2.c_str(), COLOR_LOCNAME);
+                    } else {
+                        ctx.out_char('$');
+                        ctx.out_long(idx2, 10);
+                    }
                     break;
                 }
                     

@@ -24,6 +24,9 @@ enum class operand_type : uint8_t {
     intrinsic1  = 10,   // Intrinsic function ID (1 arg) - 3.12+
     intrinsic2  = 11,   // Intrinsic function ID (2 args) - 3.12+
     hasarg      = 12,   // Has argument (generic, display as number)
+    binop       = 13,   // Binary operator (NB_ADD, etc.) - 3.11+
+    common_const = 14,  // Common constant index - 3.14+ (AssertionError, etc.)
+    local_pair  = 15,   // Two packed 4-bit local indices (3.13+): arg>>4, arg&15
 };
 
 // Check if operand type is a jump

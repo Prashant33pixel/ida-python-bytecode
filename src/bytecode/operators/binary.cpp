@@ -33,6 +33,7 @@ static const char* const binary_ops[] = {
     "-=",   // 23 NB_INPLACE_SUBTRACT
     "/=",   // 24 NB_INPLACE_TRUE_DIVIDE
     "^=",   // 25 NB_INPLACE_XOR
+    "[]",   // 26 NB_SUBSCR (3.14+)
 };
 
 const char* get_binary_op_name(uint8_t op) {

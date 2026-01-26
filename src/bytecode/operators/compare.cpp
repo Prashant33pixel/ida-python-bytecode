@@ -10,14 +10,17 @@ static const char* const cmp_ops[] = {
     "<", "<=", "==", "!=", ">", ">="
 };
 
-const char* get_cmp_op_name(uint8_t op, bool is_py312_plus) {
+const char* get_cmp_op_name(uint8_t op, uint8_t py_major, uint8_t py_minor) {
     uint8_t cmp_idx;
-    if (is_py312_plus) {
-        // Python 3.12+ encodes comparison op in bits 5-7
-        // Lower bits contain flags (bit 4 = invert result)
+    if (py_major == 3 && py_minor == 12) {
+        // Python 3.12 only: comparison op in bits 4-7
+        // Changed under GH-100923
+        cmp_idx = op >> 4;
+    } else if (py_major > 3 || (py_major == 3 && py_minor >= 13)) {
+        // Python 3.13+: comparison op in bits 5-7
         cmp_idx = op >> 5;
     } else {
-        // Python < 3.12 uses direct index
+        // Python < 3.12: direct index
         cmp_idx = op;
     }
     if (cmp_idx < 6)
