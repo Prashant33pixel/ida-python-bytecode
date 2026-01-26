@@ -12,6 +12,7 @@
 #include <segregs.hpp>
 #include <frame.hpp>
 #include <xref.hpp>
+#include <cstring>
 
 #include "../../core/common/types.hpp"
 #include "../../core/common/platform.hpp"
@@ -42,10 +43,11 @@ static const char* const RegNames[] = {
 };
 
 // ============================================================================
-// EXTENDED_ARG opcode constant
+// EXTENDED_ARG opcode constants
 // ============================================================================
 
-constexpr uint8_t EXTENDED_ARG = 144;
+constexpr uint8_t EXTENDED_ARG_DEFAULT = 144;  // Python 2.x - 3.13
+constexpr uint8_t EXTENDED_ARG_314 = 69;       // Python 3.14+ (renumbered)
 
 // ============================================================================
 // Processor Module Class
@@ -64,6 +66,8 @@ struct pyc_t : public procmod_t {
     bool code_node_valid = false;
     qvector<qstring> cached_names;
     qvector<qstring> cached_varnames;
+    qvector<qstring> cached_freevars;
+    qvector<qstring> cached_cellvars;
     qvector<qstring> cached_consts;
     ea_t cached_code_base = BADADDR;
     
@@ -83,6 +87,7 @@ struct pyc_t : public procmod_t {
     // Name resolution
     bool get_name_string(ea_t ea, uint32_t idx, qstring* out);
     bool get_varname_string(ea_t ea, uint32_t idx, qstring* out);
+    bool get_free_string(ea_t ea, uint32_t idx, qstring* out);
     bool get_const_string(ea_t ea, uint32_t idx, qstring* out);
 };
 
@@ -162,6 +167,38 @@ void pyc_t::load_code_info(ea_t ea) {
             p += len + 1;
         }
     }
+
+    // Load freevars blob
+    cached_freevars.clear();
+    ssize_t freevars_len = co_node.supval(config::CO_FREEVARS_BLOB, nullptr, 0);
+    if (freevars_len > 0) {
+        qvector<char> freevars_buf;
+        freevars_buf.resize(freevars_len);
+        co_node.supval(config::CO_FREEVARS_BLOB, freevars_buf.begin(), freevars_len);
+        const char* p = freevars_buf.begin();
+        const char* end = p + freevars_len;
+        while (p < end) {
+            size_t len = strlen(p);
+            cached_freevars.push_back(qstring(p, len));
+            p += len + 1;
+        }
+    }
+
+    // Load cellvars blob
+    cached_cellvars.clear();
+    ssize_t cellvars_len = co_node.supval(config::CO_CELLVARS_BLOB, nullptr, 0);
+    if (cellvars_len > 0) {
+        qvector<char> cellvars_buf;
+        cellvars_buf.resize(cellvars_len);
+        co_node.supval(config::CO_CELLVARS_BLOB, cellvars_buf.begin(), cellvars_len);
+        const char* p = cellvars_buf.begin();
+        const char* end = p + cellvars_len;
+        while (p < end) {
+            size_t len = strlen(p);
+            cached_cellvars.push_back(qstring(p, len));
+            p += len + 1;
+        }
+    }
     
     // Load consts blob
     cached_consts.clear();
@@ -204,6 +241,27 @@ bool pyc_t::get_varname_string(ea_t ea, uint32_t idx, qstring* out) {
     return false;
 }
 
+bool pyc_t::get_free_string(ea_t ea, uint32_t idx, qstring* out) {
+    load_code_info(ea);
+    if (version_family >= version::family::py311_313) {
+        if (idx < cached_varnames.size()) {
+            *out = cached_varnames[idx];
+            return !out->empty();
+        }
+        return false;
+    }
+    if (idx < cached_cellvars.size()) {
+        *out = cached_cellvars[idx];
+        return !out->empty();
+    }
+    idx -= (uint32_t)cached_cellvars.size();
+    if (idx < cached_freevars.size()) {
+        *out = cached_freevars[idx];
+        return !out->empty();
+    }
+    return false;
+}
+
 bool pyc_t::get_const_string(ea_t ea, uint32_t idx, qstring* out) {
     load_code_info(ea);
     if (idx < cached_consts.size()) {
@@ -220,15 +278,28 @@ bool pyc_t::get_const_string(ea_t ea, uint32_t idx, qstring* out) {
 int pyc_t::ana(insn_t* insn) {
     ea_t ea = insn->ea;
     
-    // Handle EXTENDED_ARG chaining
+    // Handle EXTENDED_ARG chaining - different shift amounts per version
+    // Pre-3.6: EXTENDED_ARG shifts by 16 bits (opcode 91)
+    // 3.6+: EXTENDED_ARG shifts by 8 bits (wordcode format)
     uint32_t extended_arg = 0;
     ea_t start_ea = ea;
     
+    uint8_t ext_opcode = (version_family == version::family::py314_plus)
+        ? EXTENDED_ARG_314
+        : EXTENDED_ARG_DEFAULT;
+
     if (version_family >= version::family::py36_310) {
-        // Wordcode: check for EXTENDED_ARG prefix
-        while (get_byte(ea) == EXTENDED_ARG) {
+        // Wordcode: EXTENDED_ARG shifts by 8 bits
+        while (get_byte(ea) == ext_opcode) {
             extended_arg = (extended_arg | get_byte(ea + 1)) << 8;
             ea += 2;
+        }
+    } else {
+        // Pre-wordcode (2.x-3.5): EXTENDED_ARG shifts by 16 bits
+        while (get_byte(ea) == ext_opcode) {
+            uint16_t ext_val = get_byte(ea + 1) | (get_byte(ea + 2) << 8);
+            extended_arg = (extended_arg | ext_val) << 16;
+            ea += 3;
         }
     }
     
@@ -453,13 +524,20 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                     
                 case ida::SPEC_NAME: {
                     // Resolve name
-                    // In Python 3.11+, LOAD_GLOBAL and LOAD_ATTR use (index << 1) | flag encoding
+                    // In Python 3.11+, some opcodes encode flags in low bits:
+                    // - LOAD_GLOBAL, LOAD_ATTR: (index << 1) | flag
+                    // - LOAD_SUPER_ATTR: (index << 2) | flags
                     uint32_t idx = (uint32_t)op.value;
                     if ((version_family == version::family::py311_313 || 
                          version_family == version::family::py314_plus) && def) {
-                        if (qstrcmp(def->mnemonic, "LOAD_GLOBAL") == 0 ||
-                            qstrcmp(def->mnemonic, "LOAD_ATTR") == 0) {
-                            idx = idx >> 1;
+                        const char* mnem = def->mnemonic;
+                        if (mnem) {
+                            if (strncmp(mnem, "LOAD_SUPER_ATTR", 15) == 0) {
+                                idx = idx >> 2;
+                            } else if (strncmp(mnem, "LOAD_GLOBAL", 11) == 0 ||
+                                       strncmp(mnem, "LOAD_ATTR", 9) == 0) {
+                                idx = idx >> 1;
+                            }
                         }
                     }
                     qstring name;
@@ -484,9 +562,14 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                 }
                     
                 case ida::SPEC_FREE: {
-                    // Free variable
-                    ctx.out_keyword("free_");
-                    ctx.out_long((uint32_t)op.value, 10);
+                    // Free/cell variable
+                    qstring freevar;
+                    if (get_free_string(ctx.insn.ea, (uint32_t)op.value, &freevar)) {
+                        ctx.out_line(freevar.c_str(), COLOR_LOCNAME);
+                    } else {
+                        ctx.out_keyword("free_");
+                        ctx.out_long((uint32_t)op.value, 10);
+                    }
                     break;
                 }
                     

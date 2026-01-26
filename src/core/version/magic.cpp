@@ -238,10 +238,18 @@ const magic_entry magic_table[] = {
 const size_t magic_table_size = (sizeof(magic_table) / sizeof(magic_table[0])) - 1;
 
 // Lookup magic number in table
+// Note: Python 1.6 through 3.1 used magic+1 for unicode mode (-U flag)
+// We treat these the same as the base version
 const magic_entry* lookup_magic(uint16_t magic) {
     for (const auto* entry = magic_table; entry->name != nullptr; ++entry) {
         if (entry->magic == magic)
             return entry;
+        // Handle unicode mode +1 variants for Python versions < 3.2
+        // These versions supported the -U flag which added 1 to the magic
+        if (entry->major < 3 || (entry->major == 3 && entry->minor <= 1)) {
+            if (entry->magic + 1 == magic)
+                return entry;
+        }
     }
     return nullptr;
 }

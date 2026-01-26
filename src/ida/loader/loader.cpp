@@ -114,6 +114,14 @@ static bool create_pyc_segment(ea_t start, ea_t end, const char* name,
 // Code Object Info Structure
 // ============================================================================
 
+struct pyc_except_entry_t {
+    uint32_t start;
+    uint32_t end;
+    uint32_t target;
+    uint32_t depth;
+    bool lasti;
+};
+
 struct pyc_code_info_t {
     qstring name;           // Function/code name
     qstring qualname;       // Qualified name (3.11+)
@@ -129,9 +137,12 @@ struct pyc_code_info_t {
     qvector<qstring> consts;
     qvector<qstring> names;
     qvector<qstring> varnames;
+    qvector<qstring> freevars;
+    qvector<qstring> cellvars;
     qvector<uint8_t> linetable;
     ea_t code_ea;           // Where code is loaded
     int depth;              // Nesting depth (0 for module)
+    qvector<pyc_except_entry_t> exc_table;
     
     // Nested code objects found in consts
     qvector<pyc_code_info_t> nested_codes;
@@ -452,6 +463,46 @@ static bool read_marshal_bytes(linput_t* li, qvector<uint8_t>* out) {
     return true;
 }
 
+// ==========================================================================
+// Parse Exception Table (Python 3.11+)
+// ============================================================================
+
+static bool parse_exception_table(const qvector<uint8_t>& data,
+                                  qvector<pyc_except_entry_t>* out) {
+    out->clear();
+    size_t pos = 0;
+    auto read_varint = [&](uint32_t* value) -> bool {
+        if (pos >= data.size())
+            return false;
+        uint8_t b = data[pos++];
+        uint32_t val = b & 0x3F;
+        while (b & 0x40) {
+            if (pos >= data.size())
+                return false;
+            b = data[pos++];
+            val = (val << 6) | (b & 0x3F);
+        }
+        *value = val;
+        return true;
+    };
+
+    while (pos < data.size()) {
+        uint32_t start = 0, length = 0, target = 0, depth_lasti = 0;
+        if (!read_varint(&start) || !read_varint(&length) ||
+            !read_varint(&target) || !read_varint(&depth_lasti)) {
+            return false;
+        }
+        pyc_except_entry_t entry;
+        entry.start = start * 2;
+        entry.end = entry.start + length * 2;
+        entry.target = target * 2;
+        entry.depth = depth_lasti >> 1;
+        entry.lasti = (depth_lasti & 1) != 0;
+        out->push_back(entry);
+    }
+    return true;
+}
+
 // ============================================================================
 // Read Tuple Header
 // ============================================================================
@@ -692,6 +743,12 @@ static bool parse_code_object_inner(linput_t* li, pyc_code_info_t* info, int dep
     
     info->stacksize = read_le32(li);
     info->flags = read_le32(li);
+
+    // Remap flags for versions < 3.8 (future flags shifted in 3.8)
+    if (g_py_major < 3 || (g_py_major == 3 && g_py_minor < 8)) {
+        uint32_t high = (info->flags & 0x0FFF0000) << 4;
+        info->flags = (info->flags & 0x0000FFFF) | high;
+    }
     
     // Read code bytes
     if (!read_marshal_bytes(li, &info->code)) {
@@ -727,20 +784,45 @@ static bool parse_code_object_inner(linput_t* li, pyc_code_info_t* info, int dep
             return false;
         }
         
-        // localspluskinds (bytes object) - skip
+        // localspluskinds (bytes object)
         qvector<uint8_t> kinds;
-        read_marshal_bytes(li, &kinds);
+        if (!read_marshal_bytes(li, &kinds))
+            kinds.clear();
+
+        // Decode locals/freevars/cellvars from kinds
+        info->freevars.clear();
+        info->cellvars.clear();
+        uint32_t local_count = 0;
+        const uint8_t CO_FAST_LOCAL = 0x20;
+        const uint8_t CO_FAST_CELL  = 0x40;
+        const uint8_t CO_FAST_FREE  = 0x80;
+        size_t count = info->varnames.size();
+        if (kinds.size() < count)
+            count = kinds.size();
+        for (size_t i = 0; i < count; i++) {
+            const qstring& name = info->varnames[i];
+            uint8_t kind = kinds[i];
+            if (kind & CO_FAST_LOCAL) {
+                local_count++;
+                if (kind & CO_FAST_CELL)
+                    info->cellvars.push_back(name);
+            } else if (kind & CO_FAST_CELL) {
+                info->cellvars.push_back(name);
+            } else if (kind & CO_FAST_FREE) {
+                info->freevars.push_back(name);
+            }
+        }
+        info->nlocals = local_count;
     } else {
         // Pre-3.11: varnames, freevars, cellvars
-        qvector<qstring> freevars, cellvars;
         if (!parse_string_tuple(li, &info->varnames)) {
             info->varnames.clear();
         }
-        if (!parse_string_tuple(li, &freevars)) {
-            // Optional
+        if (!parse_string_tuple(li, &info->freevars)) {
+            info->freevars.clear();
         }
-        if (!parse_string_tuple(li, &cellvars)) {
-            // Optional
+        if (!parse_string_tuple(li, &info->cellvars)) {
+            info->cellvars.clear();
         }
     }
     
@@ -771,7 +853,9 @@ static bool parse_code_object_inner(linput_t* li, pyc_code_info_t* info, int dep
     // Read exception table (3.11+)
     if (has_exceptiontable) {
         qvector<uint8_t> exctable;
-        read_marshal_bytes(li, &exctable);
+        if (read_marshal_bytes(li, &exctable)) {
+            parse_exception_table(exctable, &info->exc_table);
+        }
     }
     
     return true;
@@ -837,6 +921,22 @@ static void load_code_object(pyc_code_info_t& code, const qstring& prefix) {
         varnames_blob.append('\0');
     }
     co_node.supset(config::CO_VARNAMES_BLOB, varnames_blob.c_str(), varnames_blob.length());
+
+    // Store freevars
+    qstring freevars_blob;
+    for (const auto& name : code.freevars) {
+        freevars_blob.append(name);
+        freevars_blob.append('\0');
+    }
+    co_node.supset(config::CO_FREEVARS_BLOB, freevars_blob.c_str(), freevars_blob.length());
+
+    // Store cellvars
+    qstring cellvars_blob;
+    for (const auto& name : code.cellvars) {
+        cellvars_blob.append(name);
+        cellvars_blob.append('\0');
+    }
+    co_node.supset(config::CO_CELLVARS_BLOB, cellvars_blob.c_str(), cellvars_blob.length());
     
     // Store consts representations
     qstring consts_blob;
@@ -845,6 +945,27 @@ static void load_code_object(pyc_code_info_t& code, const qstring& prefix) {
         consts_blob.append('\0');
     }
     co_node.supset(config::CO_CONSTS_BLOB, consts_blob.c_str(), consts_blob.length());
+
+    // Add exception handler comments (3.11+)
+    if (!code.exc_table.empty()) {
+        uint32_t code_size = (uint32_t)code.code.size();
+        for (const auto& entry : code.exc_table) {
+            if (entry.target >= code_size)
+                continue;
+            ea_t target_ea = code_base + entry.target;
+            qstring cmt;
+            cmt.sprnt("except: +0x%X..+0x%X depth=%u lasti=%u",
+                      entry.start, entry.end, entry.depth, entry.lasti ? 1 : 0);
+            qstring existing;
+            if (get_cmt(&existing, target_ea, true) > 0) {
+                existing.append("\n");
+                existing.append(cmt);
+                set_cmt(target_ea, existing.c_str(), true);
+            } else {
+                set_cmt(target_ea, cmt.c_str(), true);
+            }
+        }
+    }
     
     // Create entry point / function name
     qstring func_name;
