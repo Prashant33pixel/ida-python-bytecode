@@ -378,6 +378,12 @@ static bool read_tuple_header(linput_t* li, uint32_t* count) {
     } else if (type == marshal::TYPE_TUPLE) {
         *count = read_le32(li);
         return true;
+    } else if (type == marshal::TYPE_REF) {
+        // Reference to a previously-seen tuple - skip the 4-byte index
+        // We can't resolve the reference, so return 0 items
+        qlseek(li, 4, SEEK_CUR);
+        *count = 0;
+        return true;
     }
     return false;
 }
