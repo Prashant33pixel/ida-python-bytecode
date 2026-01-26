@@ -462,7 +462,10 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                     
                 case ida::SPEC_CMP: {
                     // Comparison operator
-                    const char* cmp_name = bytecode::operators::get_cmp_op_name((uint8_t)op.value);
+                    // Python 3.12+ encodes comparison in bits 5-7
+                    bool is_312_plus = (version_major > 3) || 
+                                       (version_major == 3 && version_minor >= 12);
+                    const char* cmp_name = bytecode::operators::get_cmp_op_name((uint8_t)op.value, is_312_plus);
                     ctx.out_line(cmp_name, COLOR_SYMBOL);
                     break;
                 }

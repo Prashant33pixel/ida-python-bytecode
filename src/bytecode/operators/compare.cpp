@@ -10,10 +10,16 @@ static const char* const cmp_ops[] = {
     "<", "<=", "==", "!=", ">", ">="
 };
 
-const char* get_cmp_op_name(uint8_t op) {
-    // Python 3.12+ comparison operators encode differently
-    // The upper 4 bits contain the comparison operation
-    uint8_t cmp_idx = op >> 4;
+const char* get_cmp_op_name(uint8_t op, bool is_py312_plus) {
+    uint8_t cmp_idx;
+    if (is_py312_plus) {
+        // Python 3.12+ encodes comparison op in bits 5-7
+        // Lower bits contain flags (bit 4 = invert result)
+        cmp_idx = op >> 5;
+    } else {
+        // Python < 3.12 uses direct index
+        cmp_idx = op;
+    }
     if (cmp_idx < 6)
         return cmp_ops[cmp_idx];
     return "??";
