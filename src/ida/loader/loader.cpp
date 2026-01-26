@@ -460,9 +460,14 @@ static bool read_tuple_header(linput_t* li, uint32_t* count) {
     uint8_t raw_type;
     if (qlread(li, &raw_type, 1) != 1) return false;
     
-    // Note: We don't track tuples in g_refs since they're containers,
-    // not atomic values. The strings inside them will be tracked.
+    bool has_ref = (raw_type & marshal::FLAG_REF) != 0;
     uint8_t type = raw_type & ~marshal::FLAG_REF;
+    
+    // Tuples with FLAG_REF must be tracked in reference table
+    // Add placeholder BEFORE reading contents (reference index assigned at type byte)
+    if (has_ref && (type == marshal::TYPE_TUPLE || type == marshal::TYPE_SMALL_TUPLE)) {
+        g_refs.add_placeholder();
+    }
     
     if (type == marshal::TYPE_SMALL_TUPLE) {
         *count = read_byte(li);

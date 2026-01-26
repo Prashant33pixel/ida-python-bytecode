@@ -130,13 +130,16 @@ void pyc_t::load_code_info(ea_t ea) {
     code_node = co_node;
     cached_code_base = code_base;
     
-    // Load names blob
+    // Load names blob (use supval for binary data with embedded NULs)
+    // First get the size, then allocate and read
     cached_names.clear();
-    qstring names_blob;
-    size_t names_len = co_node.supstr(&names_blob, config::CO_NAMES_BLOB);
+    ssize_t names_len = co_node.supval(config::CO_NAMES_BLOB, nullptr, 0);
     if (names_len > 0) {
-        const char* p = names_blob.c_str();
-        const char* end = p + names_blob.length();
+        qvector<char> names_buf;
+        names_buf.resize(names_len);
+        co_node.supval(config::CO_NAMES_BLOB, names_buf.begin(), names_len);
+        const char* p = names_buf.begin();
+        const char* end = p + names_len;
         while (p < end) {
             size_t len = strlen(p);
             cached_names.push_back(qstring(p, len));
@@ -146,11 +149,13 @@ void pyc_t::load_code_info(ea_t ea) {
     
     // Load varnames blob
     cached_varnames.clear();
-    qstring varnames_blob;
-    size_t varnames_len = co_node.supstr(&varnames_blob, config::CO_VARNAMES_BLOB);
+    ssize_t varnames_len = co_node.supval(config::CO_VARNAMES_BLOB, nullptr, 0);
     if (varnames_len > 0) {
-        const char* p = varnames_blob.c_str();
-        const char* end = p + varnames_blob.length();
+        qvector<char> varnames_buf;
+        varnames_buf.resize(varnames_len);
+        co_node.supval(config::CO_VARNAMES_BLOB, varnames_buf.begin(), varnames_len);
+        const char* p = varnames_buf.begin();
+        const char* end = p + varnames_len;
         while (p < end) {
             size_t len = strlen(p);
             cached_varnames.push_back(qstring(p, len));
@@ -160,11 +165,13 @@ void pyc_t::load_code_info(ea_t ea) {
     
     // Load consts blob
     cached_consts.clear();
-    qstring consts_blob;
-    size_t consts_len = co_node.supstr(&consts_blob, config::CO_CONSTS_BLOB);
+    ssize_t consts_len = co_node.supval(config::CO_CONSTS_BLOB, nullptr, 0);
     if (consts_len > 0) {
-        const char* p = consts_blob.c_str();
-        const char* end = p + consts_blob.length();
+        qvector<char> consts_buf;
+        consts_buf.resize(consts_len);
+        co_node.supval(config::CO_CONSTS_BLOB, consts_buf.begin(), consts_len);
+        const char* p = consts_buf.begin();
+        const char* end = p + consts_len;
         while (p < end) {
             size_t len = strlen(p);
             cached_consts.push_back(qstring(p, len));
@@ -177,13 +184,12 @@ void pyc_t::load_code_info(ea_t ea) {
 
 bool pyc_t::get_name_string(ea_t ea, uint32_t idx, qstring* out) {
     load_code_info(ea);
-    // For LOAD_GLOBAL in 3.11+, actual index is arg >> 1
-    if (version_family == version::family::py311_313 || 
-        version_family == version::family::py314_plus)
-        idx = idx >> 1;
-    
+    // Note: For LOAD_GLOBAL/LOAD_ATTR in 3.11+, caller must do >> 1 before calling
     if (idx < cached_names.size()) {
         *out = cached_names[idx];
+        // Return false if name is empty (unresolved reference)
+        if (out->empty())
+            return false;
         return true;
     }
     return false;
@@ -447,8 +453,17 @@ bool pyc_t::out_opnd(outctx_t& ctx, const op_t& op) {
                     
                 case ida::SPEC_NAME: {
                     // Resolve name
+                    // In Python 3.11+, LOAD_GLOBAL and LOAD_ATTR use (index << 1) | flag encoding
+                    uint32_t idx = (uint32_t)op.value;
+                    if ((version_family == version::family::py311_313 || 
+                         version_family == version::family::py314_plus) && def) {
+                        if (qstrcmp(def->mnemonic, "LOAD_GLOBAL") == 0 ||
+                            qstrcmp(def->mnemonic, "LOAD_ATTR") == 0) {
+                            idx = idx >> 1;
+                        }
+                    }
                     qstring name;
-                    if (get_name_string(ctx.insn.ea, (uint32_t)op.value, &name)) {
+                    if (get_name_string(ctx.insn.ea, idx, &name)) {
                         ctx.out_line(name.c_str(), COLOR_IMPNAME);
                     } else {
                         ctx.out_long((uint32_t)op.value, 10);
